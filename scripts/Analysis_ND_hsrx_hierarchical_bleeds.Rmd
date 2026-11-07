@@ -1,0 +1,1292 @@
+---
+  Project: "ADRED Paper 1"      
+  title: "Bleeds, hierarchical model secondary diagnosis"
+  author: "Lea Leeser and Roberto Viviani"
+  date: "05/2025 - 11/2026" 
+  output:
+   word_document: default
+---
+
+In this markdown file, we describe how to fit Stan models to the ADRED data. We use the bleeding side effect as an example because it is well known and therefore suitable for checking whether the model behaves as expected.
+There are different ways to run Stan. Here, we use the cmdstanr interface, documented at https://mc-stan.org/cmdstanr/index.html. Further examples and learning resources are available at https://github.com/stan-dev/example-models. You can download this repository using git and open example-models.Rproj in RStudio.
+
+In the setup block, we load the required packages, register the cmdstanr knitr engine, and run the preprocessing script.
+
+```{r setup, include=FALSE}
+# Chunk options
+knitr::opts_chunk$set(echo = TRUE, comment = "", tidy = FALSE)
+
+# Knit root = project root (R_Promotion_Paper1), independent of whether
+# chunks are evaluated in scripts/ or already in the project root
+rmd_dir <- if (basename(getwd()) == "scripts") normalizePath("..", winslash = "/") else getwd()
+
+knitr::opts_knit$set(root.dir = rmd_dir)
+
+# Packages
+library(cmdstanr)
+cmdstanr::register_knitr_engine(override = FALSE)
+
+library(dplyr)
+library(bayesplot)
+library(ggplot2)
+
+library(openxlsx)
+library(flextable)
+library(officer)
+library(tibble)
+library(grid)
+
+# Convergence diagnostics as reported in the paper:
+# Rhat < 1.05, bulk and tail ESS > 400, no divergent transitions
+check_convergence <- function(fit, pars) {
+  diag <- fit$diagnostic_summary(quiet = TRUE)
+  s <- fit$summary(variables = pars, "rhat", "ess_bulk", "ess_tail")
+  res <- data.frame(
+    max_rhat     = max(s$rhat, na.rm = TRUE),
+    min_ess_bulk = min(s$ess_bulk, na.rm = TRUE),
+    min_ess_tail = min(s$ess_tail, na.rm = TRUE),
+    divergences  = sum(diag$num_divergent)
+  )
+  res$ok <- res$max_rhat < 1.05 && res$min_ess_bulk > 400 &&
+            res$min_ess_tail > 400 && res$divergences == 0
+  print(res)
+  if (!res$ok) warning("Convergence criteria not met")
+  invisible(res)
+}
+
+# Run preprocessing once per knit (creates object `data`)
+env <- knitr::knit_global()
+if (!exists("data", envir = env, inherits = FALSE) ||
+    !is.data.frame(get("data", envir = env))) {
+  source(file.path(rmd_dir, "scripts", "Preproc_ND.R"), local = env, chdir = TRUE)
+}
+data <- get("data", envir = env)
+
+rm(env, rmd_dir)
+
+```
+
+
+## Preparing the input for stan
+Stan expects the input data as an R list, where each element contains a specific piece of information required by the model (predictors, outcome, and metadata such as the number of observations). The exact structure of this list depends on the Stan program, and the element names must match the variables declared in the model’s data block.
+The preprocessing step creates a dataset with indicator variables for ICD categories and ICD 3-digit codes, and (depending on the preprocessing script) may also generate side-effect outcomes for hierarchical analyses.
+
+The hierarchical model used here has two levels: ICD categories at the top level (defined by the first character of the ICD code) and ICD 3-digit codes at the bottom level. Since there is currently no dedicated preprocessing function for exactly this structure, we assemble the required matrices manually.
+
+In hierarchical models, coefficients at both levels are treated as latent variables drawn from population distributions. This enables structured estimation with partial pooling across related predictors. Additional predictors can be included as confounders; these are treated as ordinary fixed effects rather than as a population of latent coefficients.
+
+In this example, we use ICD categories as the top-level predictors and ICD 3-digit codes as the bottom-level predictors.
+
+```{r input_data}
+#create input list for stan
+
+#this creates a matrix where each column is an ICD-10-GM initial letter (first-character level). The columns are selected as a range in the data dataframe; the complete range is printed by the preprocessing code.
+ICDgrouptable <- as.matrix(select(data, A:Z))
+
+
+#this does the same for the ICD-10-GM three-character categories.
+ICDtable <- as.matrix(select(data, A09:Z99))
+
+#create an index linking each three-character category to its corresponding initial letter
+group_index <- match(
+  substr(colnames(ICDtable), 1, 1),
+  colnames(ICDgrouptable)
+)
+
+#optional safety checks
+stopifnot(length(group_index) == ncol(ICDtable))
+stopifnot(!any(is.na(group_index)))
+
+#this creates a matrix with the variable I want to use as confounders.
+confs <- cbind(data$Sex, data$Age.z, data$count_others, data$relevant_HD)
+
+#This is the code to compose the list. Note that stan also requires you to indicate the size of the things you are using. Hence,
+# N  is the number of rows in the dataset (observations)
+# K  is the number of initial letters (first-character level, upper level of the hierarchy)
+# J  is the number of three-character categories (lower level of the hierarchy)
+# C  is the number of covariates
+#
+# Y  is the outcome variable (bleeding)
+# groups is the matrix of the first-character-level predictors
+# preds is the matrix of the three-character-category predictors
+# confs is the matrix of the covariate values
+# group_index links each three-character category to its initial letter
+dlist <- list(
+  N = nrow(data),
+  K = ncol(ICDgrouptable),
+  J = ncol(ICDtable),
+  C = ncol(confs),
+  Y = data$bleeding,
+  groups  = ICDgrouptable,
+  preds   = ICDtable,
+  confs   = confs,
+  group_index = group_index
+)
+rm(confs)
+
+
+```
+
+## Hierarchical analysis
+
+
+In this analysis, we examine diagnostic association patterns for the adverse drug reaction bleeding. Bleeding is known to occur in connection with certain underlying medical conditions, as recorded using ICD-10-GM diagnosis codes.
+
+We fit a two-level model with the initial letter of the ICD-10-GM code (first-character level) as the upper level (top level coefficients) and three-character categories as the lower level (bottom level coefficients). This allows us to seek evidence for associations of certain initial letters in general, and for individual three-character categories associated with bleeding beyond what is expected from their initial letter.
+
+In the code, the first-character-level predictors are stored in `groups` (number `K`, coefficients `gamma`), and the three-character categories in `preds` (number `J`, category-specific coefficients `delta`). `group_index` links each three-character category to its initial letter, and the total effect of a category is `gamma + delta`. The term "group" in variable names refers to the first-character level and is kept for compatibility with the Stan models.
+
+Different population models can be used for the coefficients. Three are available: a normal distribution, a Student-t distribution, and the horseshoe. The horseshoe is used to set a sparsity prior on the coefficients.
+
+Here, we use the horseshoe for the first-character level and model the coefficients of the three-character categories with a Student-t distribution (df = 4) (hst model). The following code fits the model in three steps: it completes the input list with the horseshoe parameters, loads or compiles the Stan model, and fits the model to the data.
+
+```{r fithst, message=FALSE, warning=FALSE, results="hide"}
+#The input list is expanded with the values needed to set up the horseshoe. This part of the initialisation is placed here because it depends on the model used, whereas setting up the data does not.
+
+#Horseshoe settings. p0 is the prior guess of the number of initial letters (first-character level) that may be associated with bleeding.
+#This can be a delicate choice, because it may affect the estimates of coefficients if the data do not support a clear estimate of the size of the population of coefficients that are not null.
+#The stan program expects the variable global_scale that is set up depending on the number of plausible real effects using the formula as suggested by Vehtari et al. 
+p0 <- 6
+p <- dlist$K
+n <- dlist$N
+mny <- mean(dlist$Y)
+pseudosigma <- 1 / sqrt(mny*(1-mny))
+global_scale <- p0/(p-p0) * pseudosigma/sqrt(n)  
+rm(list = c("p0", "p", "n", "mny", "pseudosigma"))
+
+#sometimes this strategy gives difficulties when fitting the model to the data, such as many "divergent transitions". In this case, we use a slightly more optimistic prior global_scale.
+#global_scale <- 0.05
+
+#slab parameters of the regularised horseshoe, which regularise the magnitude of large coefficients. These are commonly used values.
+slab_scale <- 2.5  #also 1.5 works well
+slab_df <- 6  #also 8 works well
+
+#add these values to the input list
+dlist$scale_global <- global_scale
+dlist$nu_global <- 1
+dlist$slab_scale <- slab_scale
+dlist$nu_local <- 1
+dlist$slab_df <- slab_df
+
+#degrees of freedom of the Student-t prior for the lower level (three-character categories). The lower this value, the heavier the tails, allowing larger deviations of category-specific coefficients. At df values of 1 or 2, the model is usually difficult to fit, presumably because of weak identifiability relative to the first-character level when only few categories share an initial letter. Four is a good value, but higher values are also acceptable.
+dlist$deltaDf <- 4
+
+#the next line loads the model. Depending on the model one loads, the coefficients are modelled as population with different distributions. Here, "hst" means horseshoe at the first-character level and Student-t at the level of the three-character categories.
+#cmdstanr compiles the model if it was not done before; so, the first time this line is run, it may take some time.
+#If you look at the file stanmod_hst.stan, you'll see that there is a first section called ''data''. This contains all that you have to put into the input list to fit the model. If anything is missing, stan emits an error code.
+
+
+hst <- cmdstan_model("./stan/stanmod_hst.stan")
+
+
+
+#the next line fits the model. The only argument you absolutely need is ''data''. 
+#seed is a random seed (you may change that without bad consequences). 
+#max_treedepth and adapt_delta change the default values to prudential values because this is a complex model that is somewhat difficult to fit. This makes the model slower to fit. When experimenting, delete these two variables to use the default.
+fithst <- hst$sample(data = dlist, seed = 124, chains = 4, sig_figs = 3,
+                     parallel_chains = 4, max_treedepth = 15, adapt_delta = 0.99,
+                     iter_warmup = 1000, iter_sampling = 1000)
+
+
+#fithst now contains the data on the fit. It is an object with several methods to extract information (see the tutorials on cmdstanr). To look at the coefficients, you need to know how the model was written. If you look at stanmod_hst.stan, you'll find the names of these variables in the sections ''parameters'' and ''transformed parameters''. In stanmod_hst, "gamma" are the first-character-level coefficients, "delta" the category-specific coefficients, "alpha" the intercept, and "beta" the covariate coefficients.
+
+#you can save the fitted model to disk if you want. It is huge though. git is set up not to version these objects.
+fithst$save_object(file = file.path("./rds", "fithst_ICD_ND_bleeds.RDS"))
+
+```
+
+
+```{r hst_convergence}
+check_convergence(fithst, c("alpha", "beta", "gamma", "delta", "total_effect"))
+```
+
+When executing the code above, you might encounter error messages to the extent that some parameter values were rejected. When they occur at the beginning of the fitting process, as is the case here, these message are ok. They arise because at the start the programme is exploring parameter ranges and in so doing it encounters parameter combinations that are not permissible (such as division by zero). Stan quickly moves to parameters that are consistent with the data, and then these messages should no longer occur.
+
+If you only want to load the saved RDS file (instead of fitting the model again).
+
+```{r fithst_openRDS}
+#you can load a saved model with the following line, if you saved it
+fithst <- readRDS("rds/fithst_ICD_ND_bleeds.RDS")
+
+```
+
+### Top level coefficients
+
+Because the coefficients were modelled as a population, it makes sense to plot a histogram of the fitted coefficients. We first do it for the top level.
+
+```{r hst_gammahist}
+
+#the top level coefficients have the collective name of ''gamma''.
+hist(fithst$summary("gamma")$median, 60, main = "ICD_ND coefficients", xlab = NULL)
+```
+
+Candidate initial letters (first-character level) are shown in the intervals plot:
+
+```{r hst_gammaints}
+
+plt <- bayesplot::mcmc_intervals(
+  fithst$draws("gamma"),
+  point_size = 2,
+  inner_size = 1,
+  outer_size = 0.5
+) +
+  geom_vline(xintercept = 0, color = "grey30", linewidth = 0.25, alpha = 0.4) +
+  theme(
+    panel.grid.major = element_line(color = "grey60", linewidth = 0.1),
+    panel.grid.minor = element_line(color = "grey60", linewidth = 0.1),
+    axis.text.y = element_text(size = 8),
+    axis.ticks.y = element_line(linewidth = 0.2),
+    axis.ticks.length.y = unit(1, "mm")
+  )
+
+# explicit y-axis labels (initial letters)
+plt$scales$scales[[1]]$labels <- rev(colnames(ICDgrouptable))
+
+plt
+
+ggsave(
+  plot = plt,
+  filename = "./output/Plot_ND_hst_ICD_bleeds_ND_initial_letter.jpg",
+  device = "jpeg",
+  width = 8, height = 12, units = "in",
+  dpi = 300
+)
+
+```
+
+The outer intervals here are the 90% credible intervals (5% for directional hypotheses), the thick inner lines the 50% intervals. One can see a very clear effect for the initial letters D and K.
+
+The following code prints information on estimates and credible intervals.
+
+```{r hst_gammatable}
+tmp <- fithst$summary("gamma")
+tmp[1] <- colnames(ICDgrouptable)
+#the .65 number is like a z score to filter the output
+tmp %>% filter(median/mad > .65) %>% arrange(-median/mad)
+
+```
+
+### Bottom level coefficients
+
+Evidence for ICD-3-digits is more sparse, with a clear peak at zero. 
+
+```{r hst_totaleffecthist}
+hist(fithst$summary("total_effect")$mean, 30, main = "total effect (initial letter + category) ICD ND coefs", xlab = NULL)
+plt <- bayesplot::mcmc_intervals(fithst$draws("total_effect"),
+                                 point_size = 2,
+                                 inner_size = 1,
+                                 outer_size = 0.5) +
+  geom_vline(xintercept = 0, color = "grey30", linewidth = 0.25, alpha = 0.4) +
+  theme(
+    panel.grid.major = element_line(color = "grey60", linewidth = 0.1),
+    panel.grid.minor = element_line(color = "grey60", linewidth = 0.1)
+  )
+plt$scales$scales[[1]]$labels <- rev(colnames(ICDtable))
+plt <- plt + theme(axis.text.y = element_text(size = 7),    
+                   axis.ticks.y = element_line(linewidth = 0.2),
+                   axis.ticks.length.y = unit(1, "mm")
+  )
+plt
+#use this code to save to file in subdirectory Plots
+ggsave(
+  plot = plt,
+  filename = "./output/Plot_ND_hst_ICD_bleeds_ND_totaleffect.jpg",
+  width = 8, height = 12, units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+``` 
+
+
+```{r hst_positive_totaleffect_predictors}
+# Summary
+tmp <- fithst$summary("total_effect")
+tmp$code <- colnames(ICDtable)
+
+# Add quantiles
+dr <- fithst$draws("total_effect", format = "matrix")
+
+q <- apply(dr, 2, function(x) {
+  quantile(x, probs = c(0.05, 0.25))
+})
+
+tmp$q5  <- q[1, ]
+tmp$q25 <- q[2, ]
+
+# Classify predictors
+filtered_tmp <- tmp %>%
+  mutate(
+    predictor_class = case_when(
+      q5 > 0 ~ "Strong positive predictor",
+      q25 > 0 ~ "Weak positive predictor",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(
+    !is.na(predictor_class),
+    median / mad > 0.65
+  ) %>%
+  arrange(predictor_class, desc(median / mad))
+
+# Codes to plot
+keep_codes <- filtered_tmp$code
+
+# Posterior draws only for selected ICD codes
+dr_selected <- fithst$draws("total_effect", format = "matrix")[,
+                       match(keep_codes, colnames(ICDtable))]
+
+# Plot
+plt <- bayesplot::mcmc_intervals(
+  dr_selected,
+  point_size = 2,
+  inner_size = 1,
+  outer_size = 0.5
+) +
+  geom_vline(
+    xintercept = 0,
+    color = "grey30",
+    linewidth = 0.25,
+    alpha = 0.4
+  ) +
+  theme(
+    panel.grid.major = element_line(color = "grey60", linewidth = 0.1),
+    panel.grid.minor = element_line(color = "grey60", linewidth = 0.1),
+    axis.text.y = element_text(size = 7),
+    axis.ticks.y = element_line(linewidth = 0.2),
+    axis.ticks.length.y = unit(1, "mm")
+  )
+
+plt$scales$scales[[1]]$labels <- rev(filtered_tmp$code)
+
+plt
+
+#use this code to save to file in subdirectory Plots
+ggsave(
+  plot = plt,
+  filename = "./output/Plot_ND_hst_ICD_bleeds_ND_totaleffect_positive_predictors.jpg",
+  width = 6, height = 8, units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+
+```
+Ranked posterior total effects of ICD-10-GM categories
+
+```{r hst_totaleffect_ranked}
+
+# Posterior draws
+dr <- fithst$draws("total_effect", format = "matrix")
+
+# Sort ICD codes by posterior median (largest effects first)
+ord <- order(apply(dr, 2, median), decreasing = TRUE)
+
+dr_sorted <- dr[, ord]
+
+# ICD labels in same order
+ICD_sorted <- colnames(ICDtable)[ord]
+
+# Histogram
+hist(
+  fithst$summary("total_effect")$mean,
+  30,
+  main = "total effect (initial letter + category) ICD ND coefs",
+  xlab = NULL
+)
+
+# Posterior interval plot
+plt <- bayesplot::mcmc_intervals(
+  dr_sorted,
+  point_size = 0.8,
+  inner_size = 0.7,
+  outer_size = 0.3
+) +
+  geom_vline(
+    xintercept = 0,
+    color = "grey30",
+    linewidth = 0.25,
+    alpha = 0.4
+  ) +
+  theme(
+    panel.grid.major = element_line(color = "grey60", linewidth = 0.1),
+    panel.grid.minor = element_line(color = "grey60", linewidth = 0.1),
+    axis.text.y = element_text(size = 7),
+    axis.ticks.y = element_line(linewidth = 0.2),
+    axis.ticks.length.y = unit(1, "mm")
+  )
+
+plt$scales$scales[[1]]$labels <- rev(ICD_sorted)
+
+plt
+
+ggsave(
+  plot = plt,
+  filename = "./output/Plot_ND_hst_ICD_bleeds_ND_totaleffect_sorted.jpg",
+  width = 8,
+  height = 12,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+
+```{r hst_totaleffecttable}
+tmp <- fithst$summary("total_effect")
+tmp[1] <- colnames(ICDtable)
+tmp %>% filter(median/mad > .65) %>% arrange(-median/mad)
+
+# Filter rows where median / mad > 0.65 in a separate variable (for save)
+filtered_tmp <- tmp %>% filter(median / mad > 0.65) %>% arrange(-median / mad)
+
+# Define the save path for the Excel file
+save_path_xlsx <- "./output/Table_ND_hst_ICD_bleeds_ND_totaleffect.xlsx"
+
+# Create the directory if it doesn't exist
+if (!dir.exists(dirname(save_path_xlsx))) {
+  dir.create(dirname(save_path_xlsx), recursive = TRUE)
+}
+
+# Save the filtered table as an Excel file
+write.xlsx(filtered_tmp, file = save_path_xlsx)
+
+```
+
+Create a publication-ready Word table of the total effects (gamma + delta) of the three-character categories from the hierarchical model.
+
+```{r hst_totaleffecttable_word}
+
+if (!requireNamespace("xml2", quietly = TRUE)) install.packages("xml2")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("stringr", quietly = TRUE)) install.packages("stringr")
+if (!requireNamespace("purrr", quietly = TRUE)) install.packages("purrr")
+
+library(xml2)
+library(dplyr)
+library(stringr)
+library(purrr)
+
+# --- Load WHO ICD-10 2019 (English, ClaML) ---
+zip_url  <- "https://icdcdn.who.int/icd10/claml/icd102019en.xml.zip"
+zip_file <- "icd102019en.xml.zip"
+
+if (!file.exists(zip_file)) {
+  download.file(zip_url, destfile = zip_file, mode = "wb")
+}
+
+xml_file <- unzip(zip_file, list = TRUE)$Name[1]
+if (!file.exists(xml_file)) {
+  unzip(zip_file, exdir = ".")
+}
+
+xml_doc <- read_xml(xml_file)
+
+# --- Keep only actual diagnosis categories (kind="category") ---
+class_nodes <- xml_find_all(xml_doc, ".//*[local-name()='Class'][@kind='category']")
+
+icd10_who <- tibble(
+  code = xml_attr(class_nodes, "code"),
+  description = map_chr(class_nodes, function(cl) {
+    lab <- xml_find_first(cl, ".//*[local-name()='Rubric'][@kind='preferred']/*[local-name()='Label']")
+    txt <- tryCatch(xml_text(lab), error = function(e) NA_character_)
+    if (length(txt) == 0) NA_character_ else txt
+  })
+) %>%
+  mutate(code = str_trim(code)) %>%
+  filter(!is.na(code), !is.na(description))
+
+message(sprintf("Parsed %d ICD-10-WHO entries.", nrow(icd10_who)))
+stopifnot(nrow(icd10_who) > 0)
+
+# --- Reduce to 3-character categories ---
+icd10_labels <- icd10_who %>%
+  mutate(code = str_extract(code, "^[A-Z][0-9]{2}")) %>%
+  filter(!is.na(code)) %>%
+  distinct(code, .keep_all = TRUE)
+
+# --- Add categories missing from the XML lookup ---
+missing_labels <- tibble::tribble(
+  ~code, ~description,
+  "D90", "Immunocompromise following radiation, chemotherapy and other immunosuppressive measures",
+  "U50", "Motor impairment",
+  "U99", "Special procedures for testing for SARS-CoV-2"
+)
+
+icd10_labels <- bind_rows(icd10_labels, missing_labels) %>%
+  distinct(code, .keep_all = TRUE)
+
+# Posterior draws 
+dr <- fithst$draws("total_effect", format = "matrix")
+
+# Extract index from names like "total_effect[123]"
+idx <- as.integer(sub(".*\\[(\\d+)\\].*", "\\1", colnames(dr)))
+if (anyNA(idx)) idx <- seq_len(ncol(dr))
+
+# Summaries from draws 
+s <- t(apply(dr, 2, function(x) {
+  q <- as.numeric(quantile(x, c(.05, .25, .75, .95)))
+  c(median = median(x), mad = mad(x), q5 = q[1], q25 = q[2], q75 = q[3], q95 = q[4])
+}))
+s <- as.data.frame(s)
+colnames(s) <- c("median","mad","q5","q25","q75","q95")
+
+# Build rows + classify 
+tmp <- as_tibble(s) %>%
+  mutate(
+    code  = colnames(ICDtable)[idx],
+    score = median / mad,
+    predictor_class = case_when(
+      q5  > 0 ~ "Strong positive predictor",
+      q25 > 0 ~ "Weak positive predictor",
+      TRUE    ~ NA_character_
+    ),
+    median_fmt = sprintf("%.2f", median),
+    ci50 = sprintf("%.2f–%.2f", q25, q75),
+    ci90 = sprintf("%.2f–%.2f", q5,  q95)
+  ) %>%
+  left_join(icd10_labels, by = "code") %>%
+  mutate(description = ifelse(is.na(description), "", description)) %>%
+  filter(score > 0.65, !is.na(predictor_class)) %>%
+  arrange(predictor_class, desc(score))
+
+make_section <- function(df, title){
+  bind_rows(
+    tibble(code = title, description = "", median_fmt = "", ci50 = "", ci90 = ""),
+    df %>% transmute(code, description, median_fmt, ci50, ci90)
+  )
+}
+
+out_word <- bind_rows(
+  make_section(filter(tmp, predictor_class == "Strong positive predictor"),
+               "Strong positive predictor"),
+  make_section(filter(tmp, predictor_class == "Weak positive predictor"),
+               "Weak positive predictor")
+)
+
+# Flextable 
+ft <- flextable(out_word)
+ft <- set_header_labels(
+  ft,
+  code = "ICD-Code",
+  description = "Description",
+  median_fmt = "Median",
+  ci50 = "50% credible interval",
+  ci90 = "90% credible interval"
+)
+
+ft <- theme_vanilla(ft)
+
+# Header row grey
+ft <- bg(ft, bg = "#D9D9D9", part = "header")
+ft <- bold(ft, part = "header")
+
+ft <- fontsize(ft, size = 10, part = "all")
+ft <- align(ft, align = "left", part = "all")
+ft <- valign(ft, valign = "top", part = "all")
+ft <- autofit(ft)
+
+# Ensure the table itself is not centered
+ft <- set_table_properties(ft, layout = "fixed", width = 0.98)
+
+ft <- width(ft, j = 1, width = 0.8)
+ft <- width(ft, j = 2, width = 2.6)
+ft <- width(ft, j = 3, width = 0.9)
+ft <- width(ft, j = 4, width = 1.4)
+ft <- width(ft, j = 5, width = 1.4)
+
+# Section header rows
+section_rows <- which(out_word$code %in% c("Strong positive predictor", "Weak positive predictor"))
+for (r in section_rows) {
+  ft <- merge_at(ft, i = r, j = 1:5, part = "body")
+  ft <- bg(ft, i = r, bg = "#D9D9D9", part = "body")
+  ft <- bold(ft, i = r, bold = TRUE, part = "body")
+}
+
+# Borders
+inner <- fp_border(color = "grey", width = 0.5)
+outer <- fp_border(color = "grey", width = 0.8)
+
+ft <- border_inner_h(ft, border = inner, part = "all")
+ft <- border_inner_v(ft, border = inner, part = "all")
+ft <- border_outer(ft, border = outer, part = "all")
+
+# Caption + legend
+caption_text <- "Table X. Potential positive predictors of bleeding among three-character ICD-10-GM categories of secondary diagnoses, combining first-character-level and category-specific effects (total effect = γ + δ), from the hierarchical horseshoe regression model (hst model). Estimates are given on the log-odds scale."
+
+legend_text <- "The analysis was performed using ICD-10-GM codes. For readability, the corresponding English three-character category descriptions are reported in the table; titles of ICD-10-GM-specific codes (D90, U50, U99) are author translations. The table reports the posterior median (log-odds scale) together with the 50% (Q25–Q75) and 90% (Q5–Q95) credible intervals for the total effect of each three-character category, combining the first-character-level and category-specific effects (total effect = γ + δ). Predictors are included only if the association is positive (strong: 90% CrI entirely above zero; weak: 50% CrI entirely above zero and 90% CrI including zero) and if median/MAD > 0.65. CrI, credible interval; MAD, median absolute deviation."
+
+# Write Word document
+dir.create("./output", recursive = TRUE, showWarnings = FALSE)
+
+doc <- read_docx()
+
+doc <- body_add_fpar(
+  doc,
+  fpar(
+    ftext(caption_text, fp_text(bold = FALSE, font.size = 11)),
+    fp_p = fp_par(text.align = "left")
+  )
+)
+
+doc <- body_add_par(doc, "", style = "Normal")
+
+doc <- body_add_flextable(doc, ft, align = "left")
+
+doc <- body_add_par(doc, "", style = "Normal")
+
+doc <- body_add_fpar(
+  doc,
+  fpar(
+    ftext(legend_text, fp_text(font.size = 9, italic = TRUE)),
+    fp_p = fp_par(text.align = "left")
+  )
+)
+
+print(doc, target = "./output/Table_ND_hst_ICD_bleeds_ND_totaleffect.docx")
+
+```
+
+
+A central concern regarding the reporting of odds ratios in this study design is the risk of misinterpretation as an absolute measure of risk. Since all cases in the dataset are clinically validated adverse drug reaction (ADR) cases (case/non-case design, where Y = ICD-10-GM-coded bleeding yes/no), the odds ratio merely reflects the relative overrepresentation of a predictor among ADR cases with bleeding compared with other ADRs, not a risk in the treated population or the general population. A high odds ratio therefore does not mean that patients with the corresponding predictor have a correspondingly elevated clinical risk of bleeding under the medication under study — it merely indicates that the proportion of bleeding cases is substantially higher when this predictor is present, relative to other ADRs. An unreflective clinical interpretation would therefore fail to acknowledge the limitations of the study design, in particular the absence of patients without ADRs and possible distortions due to coding and documentation practices.
+
+
+### Confounders
+
+You might also want to have a look at the confounders.
+
+```{r hst_confounders}
+tmp <- fithst$summary("beta") 
+tmp %>% arrange(-abs(median)/mad)
+
+#For saving in Excel
+
+# Get the summary statistics for parameter group "beta"
+tmp <- fithst$summary("beta")
+tmp_sorted <- tmp %>% arrange(-abs(median) / mad)
+
+# Define the path where the Excel file will be saved
+save_path_xlsx <- "./output/Table_ND_hst_ICD_bleeds_ICD_ND_3_confounder.xlsx"
+
+# Create a new Excel workbook
+wb <- createWorkbook()
+
+# Add a worksheet named "Betas"
+addWorksheet(wb, "Betas")
+
+# Write the sorted summary data into the "Betas" worksheet
+writeData(wb, "Betas", tmp_sorted)
+
+# Save the workbook to the specified path, overwrite if file exists
+saveWorkbook(wb, save_path_xlsx, overwrite = TRUE)
+```
+
+Create a publication-ready results table for the bottom-level coefficients confounders from the hierarchical model in word. 
+
+```{r hst_confounders_word}
+# Confounders (beta) table (editable) -> Word (.docx)
+# Same style as delta table, but OMIT sections that are empty 
+
+# Confounder names 
+confs <- cbind(data$Sex, data$Age.z, data$count_others, data$relevant_HD)
+colnames(confs) <- c("Sex", "Age (z)", "Count others", "Relevant principal diagnosis")
+
+# Posterior draws 
+dr_b <- fithst$draws("beta", format = "matrix")
+
+idx <- as.integer(sub(".*\
+$$
+(\\d+)\
+$$
+.*", "\\1", colnames(dr_b)))
+if (anyNA(idx)) idx <- seq_len(ncol(dr_b))
+
+beta_names <- colnames(confs)
+if (length(beta_names) < ncol(dr_b)) {
+  beta_names <- c(beta_names, paste0("beta_", (length(beta_names) + 1):ncol(dr_b)))
+}
+
+# Summaries 
+s <- t(apply(dr_b, 2, function(x) {
+  q <- as.numeric(quantile(x, c(.05, .25, .75, .95)))
+  c(median = median(x), mad = mad(x), q5 = q[1], q25 = q[2], q75 = q[3], q95 = q[4])
+}))
+s <- as.data.frame(s)
+colnames(s) <- c("median","mad","q5","q25","q75","q95")
+
+# Build rows + classify
+tmp <- as_tibble(s) %>%
+  mutate(
+    confounder = beta_names[idx],
+    score = median / mad,
+    predictor_class = case_when(
+      q5  > 0 ~ "Strong positive predictor",
+      q25 > 0 ~ "Weak positive predictor",
+      TRUE    ~ NA_character_
+    ),
+      median_fmt = sprintf("%.2f", median),
+      ci50 = sprintf("%.2f–%.2f", q25, q75),
+      ci90 = sprintf("%.2f–%.2f", q5,  q95)
+  ) %>%
+  filter(score > 0.65, !is.na(predictor_class)) %>%
+  arrange(predictor_class, desc(score))
+
+make_section <- function(df, title){
+  if (nrow(df) == 0) return(NULL)  # <- omit empty sections
+  bind_rows(
+  tibble(confounder = title, median_fmt = "", ci50 = "", ci90 = ""),
+  df %>% transmute(confounder, median_fmt, ci50, ci90)
+)
+}
+
+out_word <- bind_rows(
+  make_section(filter(tmp, predictor_class == "Strong positive predictor"),
+               "Strong positive predictor"),
+  make_section(filter(tmp, predictor_class == "Weak positive predictor"),
+               "Weak positive predictor")
+)
+
+# Flextable 
+ft <- flextable(out_word)
+ft <- set_header_labels(
+  ft,
+  confounder = "",
+  median_fmt = "Median",
+  ci50 = "50% credible interval",
+  ci90 = "90% credible interval"
+)
+
+ft <- theme_vanilla(ft)
+ft <- bg(ft, bg = "#D9D9D9", part = "header")
+ft <- bold(ft, part = "header")
+
+ft <- fontsize(ft, size = 10, part = "all")
+ft <- align(ft, align = "left", part = "all")
+ft <- valign(ft, valign = "top", part = "all")
+ft <- autofit(ft)
+
+ft <- set_table_properties(ft, layout = "fixed", width = 0.98)
+ft <- width(ft, j = 1, width = 2.8)
+ft <- width(ft, j = 2, width = 0.9)
+ft <- width(ft, j = 3, width = 1.4)
+ft <- width(ft, j = 4, width = 1.4)
+
+# Section header rows formatting (only those that exist)
+section_rows <- which(out_word$confounder %in% c("Strong positive predictor", "Weak positive predictor"))
+for (r in section_rows) {
+  ft <- merge_at(ft, i = r, j = 1:4, part = "body")
+  ft <- bg(ft, i = r, bg = "#D9D9D9", part = "body")
+  ft <- bold(ft, i = r, bold = TRUE, part = "body")
+}
+
+# Borders
+inner <- fp_border(color = "grey", width = 0.5)
+outer <- fp_border(color = "grey", width = 0.8)
+ft <- border_inner_h(ft, border = inner, part = "all")
+ft <- border_inner_v(ft, border = inner, part = "all")
+ft <- border_outer(ft, border = outer, part = "all")
+
+# Caption + legend
+caption_text <- "Table X. Covariates associated with bleeding in the hierarchical horseshoe regression model."
+legend_text  <- "Legend: The table reports the posterior median together with the 50% (Q25-Q75) and 90% (Q5-Q95) credible intervals for the covariate coefficients (beta). Covariates are included only if the association is positive (strong: 90% CrI entirely above zero; weak: 50% CrI entirely above zero) and if the ratio of the posterior median to the median absolute deviation (MAD) exceeds 0.65."
+
+# Word export 
+dir.create("./output", recursive = TRUE, showWarnings = FALSE)
+doc <- read_docx()
+
+doc <- body_add_fpar(
+  doc,
+  fpar(
+    ftext(caption_text, fp_text(bold = FALSE, font.size = 11)),
+    fp_p = fp_par(text.align = "left")
+  )
+)
+doc <- body_add_par(doc, "", style = "Normal")
+doc <- body_add_flextable(doc, ft, align = "left")
+doc <- body_add_par(doc, "", style = "Normal")
+doc <- body_add_fpar(
+  doc,
+  fpar(
+    ftext(legend_text, fp_text(font.size = 9, italic = TRUE)),
+    fp_p = fp_par(text.align = "left")
+  )
+)
+
+print(doc, target = "./output/Table_ND_hst_ICD_bleeds_confounder.docx")
+```
+
+### Sensitivity analysis
+
+Sensitivity analysis refers to verifying that the model is not unduly influenced by few observations or individual details. In the Bayesian setting, this includes verifying that priors do not exert undue influence on the determination of coefficients.
+
+When there is enough information in the data to determine these coefficients, priors have little influence on the outcome. Especially in complex models, however, the situation may occur where the model is underdetermined by the data.
+
+For this class of models the prior on the number of expected nonzero coefficients may have considerable influence on estimates and their credible intervals. We therefore fit a model with just the expectation of only one nonzero coefficient.
+
+```{r fithstex, message=FALSE, warning=FALSE, results="hide"}
+p0 <- 1
+p <- dlist$K
+n <- dlist$N
+mny <- mean(dlist$Y)
+pseudosigma <- 1 / sqrt(mny*(1-mny))
+global_scale <- p0/(p-p0) * pseudosigma/sqrt(n)  
+rm(list = c("p0", "p", "n", "mny", "pseudosigma"))
+
+slab_scale <- 2.5 
+slab_df <- 6  
+
+#add these values to the input list
+dlist$scale_global <- global_scale
+dlist$nu_global <- 1
+dlist$slab_scale <- slab_scale
+dlist$nu_local <- 1
+dlist$slab_df <- slab_df
+
+#this parameter is the df's of the t distribution for the bottom level
+dlist$deltaDf <- 4
+
+
+#the next line loads the model. Depending on the model one loads, the coefficients are modelled as population with different distributions. Here, ''hst'' meand horseshoe at the top and t at the bottom.
+#cmdstanr compiles the model if it was not done before; so, the first time this line is run, it may take some time.
+#If you look at the file stanmod_hst.stan, you'll see that there is a first section called ''data''. This contains all that you have to put into the input list to fit the model. If anything is missing, stan emits an error code.
+
+
+hst <- cmdstan_model("./stan/stanmod_hst.stan")
+
+#fit
+fithstex <- hst$sample(data = dlist, seed = 124, chains = 4, sig_figs = 3, 
+                     parallel_chains = 4, max_treedepth = 15, adapt_delta = 0.99, 
+                     iter_warmup = 1000, iter_sampling = 1000)
+
+
+#you can save the fitted model to disk if you want. It is huge though. git is set up not to version these objects.
+fithstex$save_object(file = file.path("./rds", "fithstex_ICD_ND_bleeds.RDS"))
+```
+
+```{r hstex_convergence}
+check_convergence(fithstex, c("alpha", "beta", "gamma", "delta", "total_effect"))
+
+```
+
+If you only want to load the saved RDS file (instead of fitting the model again).
+
+```{r fithstex_openRDS }
+#you can load a saved model with the following line, if you saved it
+fithstex <- readRDS("rds/fithstex_ICD_ND_bleeds.RDS")
+
+```
+
+### Top level coefficients
+
+Because the coefficients were modelled as a population, it makes sense to plot a histogram of the fitted coefficients. We first do it for the top level.
+
+```{r hstex_gammahist}
+
+#the top level coefficients have the collective name of ''gamma''.
+hist(fithstex$summary("gamma")$median, 60, main = "ICD_ND_sensitivity coefficients", xlab = NULL)
+```
+
+Fitting takes longer, but generates much the same output.
+
+```{r hstex_gammaints}
+plt_sens <- bayesplot::mcmc_intervals(
+  fithstex$draws("gamma"),
+  point_size = 2,
+  inner_size = 1,
+  outer_size = 0.5
+) +
+  geom_vline(xintercept = 0, color = "grey30", linewidth = 0.25, alpha = 0.4) +
+  theme(
+    panel.grid.major = element_line(color = "grey60", linewidth = 0.1),
+    panel.grid.minor = element_line(color = "grey60", linewidth = 0.1),
+    axis.text.y = element_text(size = 8),
+    axis.ticks.y = element_line(linewidth = 0.2),
+    axis.ticks.length.y = unit(1, "mm")
+  )
+
+# explicit y-axis labels (initial letters)
+plt_sens$scales$scales[[1]]$labels <- rev(colnames(ICDgrouptable))
+
+plt_sens
+
+
+#use this code to save to file in subdirectory Plots
+ggsave(
+  plot = plt_sens,
+  filename = "./output/Plot_ND_hst_ICD_bleeds_ND_initial_letter_sensitivity.jpg",
+  width = 8, height = 12, units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+```
+
+## Horseshoe in groups and observations
+
+The existence of three-character categories with effects beyond those captured by their initial letter motivates us to consider a model in which the horseshoe prior is applied to both the first-character level and the individual three-character categories (hshs model). This provides an opportunity to demonstrate how an alternative population model is specified.
+
+The input list for the data is the same, but the parameters for the model, and the model itself, now differ.
+
+```{r fithshs, message=FALSE, warning=FALSE, results="hide"}
+#Horseshoe settings for the top level → #Horseshoe settings for the first-character level
+p0 <- 6
+p <- dlist$K
+n <- dlist$N
+mny <- mean(dlist$Y)
+pseudosigma <- 1 / sqrt(mny*(1-mny))
+global_scale <- p0/(p-p0) * pseudosigma/sqrt(n)  
+slab_scale <- 2.5
+slab_df <- 8
+
+dlist$grp_scale_global <- global_scale
+dlist$grp_nu_global <- 1
+dlist$grp_slab_scale <- slab_scale
+dlist$grp_nu_local <- 1
+dlist$grp_slab_df <- slab_df
+
+#Horseshoe settings for the three-character categories
+p0 <- 6
+p <- dlist$J #n, mny same as before
+pseudosigma <- 1 / sqrt(mny*(1-mny))
+global_scale <- p0/(p-p0) * pseudosigma/sqrt(n)  
+slab_scale <- 2.5
+slab_df <- 8
+
+dlist$obs_scale_global <- global_scale
+dlist$obs_nu_global <- 1
+dlist$obs_slab_scale <- slab_scale
+dlist$obs_nu_local <- 1
+dlist$obs_slab_df <- slab_df
+
+rm(list = c("p0", "p", "n", "mny", "pseudosigma"))
+
+#the next line loads the model. Depending on the model one loads, the coefficients are modelled as population with different distributions. Here, "hshs" means horseshoe at both the first-character level and the level of the three-character categories.
+#cmdstanr compiles the model if it was not done before; so, the first time this line is run, it may take some time.
+#If you look at the file stanmod_hshs.stan, you'll see that there is a first section called ''data''. This contains all that you have to put into the input list to fit the model. If anything is missing, stan emits an error code.
+
+hshs <- cmdstan_model("./stan/stanmod_hshs.stan")
+
+# fit
+fithshs <- hshs$sample(data = dlist, seed = 124, chains = 4, sig_figs = 3, 
+                     parallel_chains = 4, max_treedepth = 15, adapt_delta = 0.99, 
+                     iter_warmup = 1000, iter_sampling = 1000)
+
+
+#you can save the fitted model to disk if you want. It is huge though. git is set up not to version these objects.
+fithshs$save_object(file = file.path("./rds", "fithshs_ICD_ND_bleed.RDS"))
+
+```
+
+```{r hshs_convergence}
+check_convergence(fithshs, c("alpha", "beta", "gamma", "delta", "total_effect"))
+```
+
+If you only want to load the saved RDS file (instead of fitting the model again).
+
+```{r fithshs_openRDS}
+#you can load a saved model with the following line, if you saved it
+fithshs <- readRDS("./rds/fithshs_ICD_ND_bleed.RDS")
+```
+
+
+### Top level coefficients
+
+
+Because the coefficients were modelled as a population, it makes sense to plot a histogram of the fitted coefficients. We first do it for the top level.
+
+```{r hshs_gammahist}
+
+#the top level coefficients have the collective name of ''gamma''.
+hist(fithshs$summary("gamma")$median, 60, main = "ICD_ND_HSHS coefficients ", xlab = NULL)
+```
+
+Candidate initial letters (first-character level) are shown in the intervals plot:
+
+```{r hshs_gammaints}
+plt_sens <- bayesplot::mcmc_intervals(
+  fithshs$draws("gamma"),
+  point_size = 2,
+  inner_size = 1,
+  outer_size = 0.5
+) +
+  geom_vline(xintercept = 0, color = "grey30", linewidth = 0.25, alpha = 0.4) +
+  theme(
+    panel.grid.major = element_line(color = "grey60", linewidth = 0.1),
+    panel.grid.minor = element_line(color = "grey60", linewidth = 0.1),
+    axis.text.y = element_text(size = 8),
+    axis.ticks.y = element_line(linewidth = 0.2),
+    axis.ticks.length.y = unit(1, "mm")
+  )
+
+# explicit y-axis labels (initial letters)
+plt_sens$scales$scales[[1]]$labels <- rev(colnames(ICDgrouptable))
+
+plt_sens
+
+
+#use this code to save to file in subdirectory Plots
+ggsave(
+  plot = plt_sens,
+  filename = "./output/Plot_ND_hshs_ICD_bleeds_ND_initial_letter.jpg",
+  width = 8, height = 12, units = "in",
+  dpi = 300,
+  bg = "white"
+)
+```
+
+### Bottom level coefficients
+
+Evidence for ICD-3-digits is more sparse, with a clear peak at zero. 
+
+```{r hshs_totaleffecthist}
+# Histogram
+hist(fithshs$summary("total_effect")$mean, 40, xlab = NULL, main = NULL)
+
+# Interval plot with the same styling as your other figure
+plt <- bayesplot::mcmc_intervals(
+  fithshs$draws("total_effect"),
+  point_size = 2,
+  inner_size = 1,
+  outer_size = 0.5
+) +
+  geom_vline(xintercept = 0, color = "grey30", linewidth = 0.25, alpha = 0.4) +
+  theme(
+    panel.grid.major = element_line(color = "grey60", linewidth = 0.1),
+    panel.grid.minor = element_line(color = "grey60", linewidth = 0.1),
+    axis.text.y = element_text(size = 7),
+    axis.ticks.y = element_line(linewidth = 0.2),
+    axis.ticks.length.y = unit(1, "mm")
+  )
+
+# explicit y-axis labels (initial letters)
+plt$scales$scales[[1]]$labels <- rev(colnames(ICDtable))
+plt
+
+# Save
+ggsave(
+  plot = plt,
+  filename = "./output/Plot_ND_hshs_ICD_bleeds_ND_totaleffect.jpg",
+  width = 8, height = 12,
+  dpi = 300,
+  bg = "white"
+)
+
+```
+
+
+```{r hshs_deltatable}
+tmp <- fithshs$summary("delta")
+tmp[1] <- colnames(ICDtable)
+tmp %>% filter(median/mad > .65) %>% arrange(-median/mad)
+
+# Filter rows where median / mad > 0.65 in a separate variable (for save)
+filtered_tmp <- tmp %>% filter(median / mad > 0.65) %>% arrange(-median / mad)
+
+# Define the save path for the Excel file
+save_path_xlsx <- "./output/Table_ND_hshs_ICD_bleeds_ND_3.xlsx"
+
+# Create the directory if it doesn't exist
+if (!dir.exists(dirname(save_path_xlsx))) {
+  dir.create(dirname(save_path_xlsx), recursive = TRUE)
+}
+
+# Save the filtered table as an Excel file
+write.xlsx(filtered_tmp, file = save_path_xlsx)
+
+```
+
+Create a publication-ready Word table of the total effects (gamma + delta) of the three-character categories from the hierarchical model.
+
+
+```{r hshs_totaleffecttable_word}
+
+if (!requireNamespace("xml2", quietly = TRUE)) install.packages("xml2")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("stringr", quietly = TRUE)) install.packages("stringr")
+if (!requireNamespace("purrr", quietly = TRUE)) install.packages("purrr")
+
+library(xml2)
+library(dplyr)
+library(stringr)
+library(purrr)
+
+# --- Load WHO ICD-10 2019 (English, ClaML) ---
+zip_url  <- "https://icdcdn.who.int/icd10/claml/icd102019en.xml.zip"
+zip_file <- "icd102019en.xml.zip"
+
+if (!file.exists(zip_file)) {
+  download.file(zip_url, destfile = zip_file, mode = "wb")
+}
+
+xml_file <- unzip(zip_file, list = TRUE)$Name[1]
+if (!file.exists(xml_file)) {
+  unzip(zip_file, exdir = ".")
+}
+
+xml_doc <- read_xml(xml_file)
+
+# --- Keep only actual diagnosis categories (kind="category") ---
+class_nodes <- xml_find_all(xml_doc, ".//*[local-name()='Class'][@kind='category']")
+
+icd10_who <- tibble(
+  code = xml_attr(class_nodes, "code"),
+  description = map_chr(class_nodes, function(cl) {
+    lab <- xml_find_first(cl, ".//*[local-name()='Rubric'][@kind='preferred']/*[local-name()='Label']")
+    txt <- tryCatch(xml_text(lab), error = function(e) NA_character_)
+    if (length(txt) == 0) NA_character_ else txt
+  })
+) %>%
+  mutate(code = str_trim(code)) %>%
+  filter(!is.na(code), !is.na(description))
+
+message(sprintf("Parsed %d ICD-10-WHO entries.", nrow(icd10_who)))
+stopifnot(nrow(icd10_who) > 0)
+
+# --- Reduce to 3-character categories ---
+icd10_labels <- icd10_who %>%
+  mutate(code = str_extract(code, "^[A-Z][0-9]{2}")) %>%
+  filter(!is.na(code)) %>%
+  distinct(code, .keep_all = TRUE)
+
+# --- Add categories missing from the XML lookup ---
+missing_labels <- tibble::tribble(
+  ~code, ~description,
+  "D90", "Immunocompromise following radiation, chemotherapy and other immunosuppressive measures",
+  "U50", "Motor impairment",
+  "U99", "Special procedures for testing for SARS-CoV-2"
+)
+
+icd10_labels <- bind_rows(icd10_labels, missing_labels) %>%
+  distinct(code, .keep_all = TRUE)
+
+
+# Posterior draws 
+dr <- fithshs$draws("total_effect", format = "matrix")
+
+# Extract index from names like "total_effect[123]"
+idx <- as.integer(sub(".*\\[(\\d+)\\].*", "\\1", colnames(dr)))
+if (anyNA(idx)) idx <- seq_len(ncol(dr))
+
+# Summaries from draws 
+s <- t(apply(dr, 2, function(x) {
+  q <- as.numeric(quantile(x, c(.05, .25, .75, .95)))
+  c(median = median(x), mad = mad(x), q5 = q[1], q25 = q[2], q75 = q[3], q95 = q[4])
+}))
+s <- as.data.frame(s)
+colnames(s) <- c("median","mad","q5","q25","q75","q95")
+
+# Build rows + classify 
+tmp <- as_tibble(s) %>%
+  mutate(
+    code  = colnames(ICDtable)[idx],
+    score = median / mad,
+    predictor_class = case_when(
+      q5  > 0 ~ "Strong positive predictor",
+      q25 > 0 ~ "Weak positive predictor",
+      TRUE    ~ NA_character_
+    ),
+    median_fmt = sprintf("%.2f", median),
+    ci50 = sprintf("%.2f–%.2f", q25, q75),
+    ci90 = sprintf("%.2f–%.2f", q5,  q95)
+  ) %>%
+  left_join(icd10_labels, by = "code") %>%
+  mutate(description = ifelse(is.na(description), "", description)) %>%
+  filter(score > 0.65, !is.na(predictor_class)) %>%
+  arrange(predictor_class, desc(score))
+
+make_section <- function(df, title){
+  bind_rows(
+    tibble(code = title, description = "", median_fmt = "", ci50 = "", ci90 = ""),
+    df %>% transmute(code, description, median_fmt, ci50, ci90)
+  )
+}
+
+out_word <- bind_rows(
+  make_section(filter(tmp, predictor_class == "Strong positive predictor"),
+               "Strong positive predictor"),
+  make_section(filter(tmp, predictor_class == "Weak positive predictor"),
+               "Weak positive predictor")
+)
+
+# Flextable 
+ft <- flextable(out_word)
+ft <- set_header_labels(
+  ft,
+  code = "ICD-Code",
+  description = "Description",
+  median_fmt = "Median",
+  ci50 = "50% credible interval",
+  ci90 = "90% credible interval"
+)
+
+ft <- theme_vanilla(ft)
+
+# Header row grey
+ft <- bg(ft, bg = "#D9D9D9", part = "header")
+ft <- bold(ft, part = "header")
+
+ft <- fontsize(ft, size = 10, part = "all")
+ft <- align(ft, align = "left", part = "all")
+ft <- valign(ft, valign = "top", part = "all")
+ft <- autofit(ft)
+
+# Ensure the table itself is not centered
+ft <- set_table_properties(ft, layout = "fixed", width = 0.98)
+
+ft <- width(ft, j = 1, width = 0.8)
+ft <- width(ft, j = 2, width = 2.6)
+ft <- width(ft, j = 3, width = 0.9)
+ft <- width(ft, j = 4, width = 1.4)
+ft <- width(ft, j = 5, width = 1.4)
+
+# Section header rows
+section_rows <- which(out_word$code %in% c("Strong positive predictor", "Weak positive predictor"))
+for (r in section_rows) {
+  ft <- merge_at(ft, i = r, j = 1:5, part = "body")
+  ft <- bg(ft, i = r, bg = "#D9D9D9", part = "body")
+  ft <- bold(ft, i = r, bold = TRUE, part = "body")
+}
+
+# Borders
+inner <- fp_border(color = "grey", width = 0.5)
+outer <- fp_border(color = "grey", width = 0.8)
+
+ft <- border_inner_h(ft, border = inner, part = "all")
+ft <- border_inner_v(ft, border = inner, part = "all")
+ft <- border_outer(ft, border = outer, part = "all")
+
+# Caption + legend
+caption_text <- "Table X. Potential positive predictors of bleeding among three-character ICD-10-GM categories of secondary diagnoses, combining first-character-level and category-specific effects (total effect = γ + δ), from the hierarchical horseshoe regression model (hshs model). Estimates are given on the log-odds scale."
+
+legend_text <- "The analysis was performed using ICD-10-GM codes. For readability, the corresponding English three-character category descriptions are reported in the table; titles of ICD-10-GM-specific codes (D90, U50, U99) are author translations. The table reports the posterior median (log-odds scale) together with the 50% (Q25–Q75) and 90% (Q5–Q95) credible intervals for the total effect of each three-character category, combining the first-character-level and category-specific effects (total effect = γ + δ). Predictors are included only if the association is positive (strong: 90% CrI entirely above zero; weak: 50% CrI entirely above zero and 90% CrI including zero) and if median/MAD > 0.65. CrI, credible interval; MAD, median absolute deviation."
+
+# Write Word document
+dir.create("./output", recursive = TRUE, showWarnings = FALSE)
+
+doc <- read_docx()
+
+doc <- body_add_fpar(
+  doc,
+  fpar(
+    ftext(caption_text, fp_text(bold = FALSE, font.size = 11)),
+    fp_p = fp_par(text.align = "left")
+  )
+)
+
+doc <- body_add_par(doc, "", style = "Normal")
+
+doc <- body_add_flextable(doc, ft, align = "left")
+
+doc <- body_add_par(doc, "", style = "Normal")
+
+doc <- body_add_fpar(
+  doc,
+  fpar(
+    ftext(legend_text, fp_text(font.size = 9, italic = TRUE)),
+    fp_p = fp_par(text.align = "left")
+  )
+)
+
+print(doc, target = "./output/Table_ND_hshs_ICD_bleeds_ND_totaleffect.docx")
+
+```
